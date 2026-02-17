@@ -2,6 +2,8 @@ package com.loinguyen.bandwidth.detekt
 
 import com.loinguyen.bandwidth.detekt.dsl.QK
 import com.loinguyen.bandwidth.detekt.dsl.getDownloadSpecData
+import com.loinguyen.bandwidth.detekt.rule.isCoroutineScopeExpr
+import com.loinguyen.bandwidth.detekt.rule.isLaunchExpr
 import io.gitlab.arturbosch.detekt.api.CodeSmell
 import io.gitlab.arturbosch.detekt.api.Config
 import io.gitlab.arturbosch.detekt.api.Debt
@@ -64,11 +66,15 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
     fun inferExpr(expression: KtExpression): QK {
         return when (expression) {
             is KtBlockExpression -> inferBlock(expression)
-            is KtCallExpression -> inferCall(expression)
             is KtIfExpression -> inferIf(expression)
+            is KtCallExpression -> {
+                if (isCoroutineScopeExpr(expression, bindingContext)) inferCoroutineScopeExpr(expression)
+                else inferCall(expression)
+            }
             else -> QK.ZERO
         }
     }
+
 
     private fun inferBlock(block: KtBlockExpression): QK {
         var acc = QK.ZERO
@@ -92,7 +98,6 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         )
     }
 
-
     @OptIn(IDEAPluginsCompatibilityAPI::class)
     private fun inferCall(call: KtCallExpression): QK {
         val desc = call.getResolvedCall(bindingContext)?.resultingDescriptor as? FunctionDescriptor
@@ -114,7 +119,50 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         return inferExpr(body)
     }
 
+    @OptIn(IDEAPluginsCompatibilityAPI::class)
+    private fun inferCoroutineScopeExpr(call: KtCallExpression): QK {
+        val body = call.lambdaArguments.singleOrNull()
+            ?.getLambdaExpression()
+            ?.bodyExpression
+            ?: return QK.ZERO
+
+        val block = body
+
+        val launchChildren = mutableListOf<QK>()
+        var sequentialAcc = QK.ZERO
+
+        for (stmt in block.statements) {
+            val stmtCall = stmt as? KtCallExpression
+            if (stmtCall != null && isLaunchExpr(stmtCall, bindingContext)) {
+                launchChildren += inferLaunchExpr(stmtCall)
+            } else {
+                sequentialAcc = seqentialCombine(sequentialAcc, inferExpr(stmt))
+            }
+        }
+
+        val parallelAcc = parallelCombine(launchChildren)
+        return seqentialCombine(sequentialAcc, parallelAcc)
+    }
+
+
+    fun inferLaunchExpr(call: KtCallExpression): QK {
+        val body = call.lambdaArguments.singleOrNull()
+            ?.getLambdaExpression()
+            ?.bodyExpression
+            ?: return QK.ZERO
+        return inferExpr(body)
+    }
 
     fun seqentialCombine(a: QK, b: QK): QK =
         QK(q = maxOf(a.q, b.q), k = max(a.k, b.k))
+
+   fun parallelCombine(children: List<QK>): QK {
+        var sumQ = 0
+        var maxK = 0.0
+        for (c in children) {
+            sumQ += c.q
+            if (c.k > maxK) maxK = c.k
+        }
+        return QK(q = sumQ, k = maxK)
+    }
 }
