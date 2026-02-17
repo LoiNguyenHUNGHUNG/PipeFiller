@@ -10,10 +10,18 @@ import com.loinguyen.bandwidth.detekt.dsl.Prio
 @DownloadSpec(size = 10.0, timeout = 2.0, prio = Prio.L) // q = 5
 fun dlA() {}
 
-@DownloadSpec(size = 3.0, timeout = 1.0, prio = Prio.H) // q = 3
+@DownloadSpec(size = 8.0, timeout = 2.0, prio = Prio.L) // q = 5
 fun dlB() {}
 
+fun dlC(x: Int) {
+    if(x == 3) {
+        dlA()
+    }
+    else {
+        dlB()
+    }
+}
+
 fun main() {
-    dlA()
-    dlB()
+    dlC(3)
 }
