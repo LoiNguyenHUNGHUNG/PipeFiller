@@ -1,2 +1,4 @@
-package com.loinguyen.bandwidth.detekt.rule 
+package com.loinguyen.bandwidth.detekt.rule
 
+class BandwidthRuleSetProvider {
+}

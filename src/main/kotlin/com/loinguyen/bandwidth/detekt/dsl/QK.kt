@@ -1,4 +1,10 @@
 package com.loinguyen.bandwidth.detekt.dsl
 
-class QK {
+data class QK (
+    val q: Int,
+    val k: Double
+) {
+    companion object {
+        val ZERO = QK(0, 0.0)
+    }
 }
