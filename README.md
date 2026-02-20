@@ -1,6 +1,8 @@
-# Bandwidth-Timeout Simulator
+# Bandwidth-Timeout Inference
 
-This project defines a **restricted Kotlin DSL** for reasoning about download concurrency and peak bandwidth demand from `main()` using a compositional summary **QK = (q, k)**.
+This project implements a static analysis tool that infers the minimum global bandwidth required to prevent timeout violations in a restricted Kotlin DSL for download concurrency. 
+
+The tool uses a compositional summary **QK = (q, k)**.
 
 * **q**: maximum number of downloads that may run **concurrently**
 * **k**: the **largest per-download required rate** among downloads that may occur
