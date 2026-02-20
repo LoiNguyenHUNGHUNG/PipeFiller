@@ -165,3 +165,66 @@ fun main() = runBlocking {
 * dlB: `(1, 4)`
 * coroutineScope: `q = 1+1 = 2`, `k = max(5,4)=5`
 * Bandwidth bound: `B = 5 * min(2,K) = 10` (if `K >= 2`)
+
+## TODO: Scheduler-Parametric Analysis
+
+Right now the analysis assumes a *maximally concurrent*, priority-agnostic scheduler:
+
+- All downloads that can overlap are assumed to overlap.
+- The global cap `K` is the only limit on concurrency.
+- The `prio` field in `@DownloadSpec` is parsed but not used.
+
+This is sound but often overly conservative.
+
+A major next step is to make the analysis **scheduler-parametric**, so that users can describe how concurrency is actually constrained in their system, and PipeFiller will infer bandwidth requirements *relative to that scheduler*.
+
+At a high level, we want users to be able to:
+
+- Define a **runtime scheduler** that their program uses.
+- Provide a corresponding **scheduler abstraction** that the inference tool uses to bound concurrency.
+
+### 1. Scheduler abstraction interface (analysis side)
+
+We plan to introduce a scheduler abstraction interface in the analysis API that mirrors the paper’s model of schedulers.
+
+Conceptually, a scheduler abstraction:
+
+- Takes per-child concurrency summaries (e.g., internal `k_i` values),
+- Takes per-child priorities,
+- Returns an upper bound on how many downloads the entire parallel region may realize concurrently.
+
+In the paper, this abstraction is an arbitrary function with a type of `Seq[Nat] -> Seq[P] -> Nat`
+
+For the implementation, we likely want a restricted and safe interface rather than executing arbitrary user code inside the analyzer.
+
+Open design questions include:
+
+- Should users attach a scheduler via an annotation before each `coroutineScope`?
+- Should we provide a wrapper such as `runCoroutineWithScheduler(...)`?
+
+### 2. Runtime scheduler framework (execution side)
+
+In principle, we would like a framework for installing runtime schedulers that
+correspond to the abstractions used in the analysis. This would allow users to:
+
+- Implement a concrete runtime scheduler,
+- Provide a matching scheduler abstraction to the inference tool,
+- And obtain bandwidth guarantees that are sound relative to that scheduler.
+
+From an engineering perspective, this is largely a Kotlin problem. The language
+does not make it straightforward to override the default coroutine scheduler,
+so we would likely need to:
+
+- Provide a wrapper around `coroutineScope { ... }`,
+- Control how `launch { ... }` blocks are scheduled within that wrapper,
+- Ensure that the runtime scheduler never realizes more concurrency than the
+  abstraction used in the analysis allows.
+
+However, this is not immediately necessary for the current stage of the project.
+
+At the moment, we do **not** rely on executing programs to evaluate the analysis.
+Instead, we manually compute the precise peak bandwidth demand of DSL programs
+and use that as ground truth to evaluate the inference tool. As a result,
+a concrete runtime scheduler implementation is not required for validation.
+
+Therefore, runtime scheduler integration is best viewed as **future work**.
