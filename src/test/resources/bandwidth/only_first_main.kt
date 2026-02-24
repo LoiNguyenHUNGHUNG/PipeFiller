@@ -1,5 +1,5 @@
 // TEST: reports only for the first main
-// EXPECT_FINDINGS: B=0.0
+// EXPECT_FINDINGS: 0
 
 package test
 

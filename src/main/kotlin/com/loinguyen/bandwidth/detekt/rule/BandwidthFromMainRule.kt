@@ -1,168 +1,153 @@
 package com.loinguyen.bandwidth.detekt
 
-import com.loinguyen.bandwidth.detekt.dsl.QK
 import com.loinguyen.bandwidth.detekt.dsl.getDownloadSpecData
+import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthData
 import com.loinguyen.bandwidth.detekt.rule.isCoroutineScopeExpr
 import com.loinguyen.bandwidth.detekt.rule.isLaunchExpr
-import io.gitlab.arturbosch.detekt.api.CodeSmell
-import io.gitlab.arturbosch.detekt.api.Config
-import io.gitlab.arturbosch.detekt.api.Debt
-import io.gitlab.arturbosch.detekt.api.Entity
-import io.gitlab.arturbosch.detekt.api.Issue
-import io.gitlab.arturbosch.detekt.api.Rule
-import io.gitlab.arturbosch.detekt.api.Severity
-import io.gitlab.arturbosch.detekt.rules.isMainFunction
+import io.gitlab.arturbosch.detekt.api.*
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
-import org.jetbrains.kotlin.psi.KtBlockExpression
-import org.jetbrains.kotlin.psi.KtCallExpression
-import org.jetbrains.kotlin.psi.KtExpression
-import org.jetbrains.kotlin.psi.KtIfExpression
-import org.jetbrains.kotlin.psi.KtNamedFunction
+import org.jetbrains.kotlin.psi.*
+import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.calls.callUtil.getResolvedCall
-import org.jetbrains.kotlin.resolve.source.getPsi
 import org.jetbrains.kotlin.utils.IDEAPluginsCompatibilityAPI
 import kotlin.math.max
 
+/**
+ * Modular scalar bandwidth checker.
+ *
+ * Each function must declare:
+ *
+ *     @RequireBandwidth(minBandwidth = X)
+ *
+ * The rule:
+ *   1. Infers minimum required bandwidth from the function body.
+ *   2. Ensures annotation >= inferred value.
+ *
+ * Semantics:
+ *   - Sequential:      max
+ *   - Conditional:     max
+ *   - Parallel launch: sum
+ *   - Primitive download: size / timeout
+ *   - Function call:   use callee's @RequireBandwidth
+ */
 class BandwidthFromMainRule(config: Config) : Rule(config) {
 
     override val issue = Issue(
         javaClass.simpleName,
         Severity.Maintainability,
-        "Infers (q,k) for program rooted at main()",
-        Debt.FIVE_MINS,
+        "Checks @RequireBandwidth against inferred bandwidth",
+        Debt.FIVE_MINS
     )
 
-    private var didAnalyzeMain: Boolean = false
-    private val Kcap: Int = valueOrDefault("K", 64)
-
-
     override fun visitNamedFunction(function: KtNamedFunction) {
-        if (!didAnalyzeMain && function.isMainFunction()) {
-            didAnalyzeMain = true
+        val body = function.bodyExpression ?: return
 
-            val bodyExpression = function.bodyExpression
-            if (bodyExpression != null) {
-                val qk = inferExpr(bodyExpression)
+        val desc = bindingContext[BindingContext.FUNCTION, function] as? FunctionDescriptor
+            ?: return
 
-                // q = concurrency, k = max per-download rate
-                val concurrency = qk.q
-                val maxRate = qk.k
+        val requireData = desc.getRequireBandwidthData() ?: return
+        val annotatedB = requireData.minBandwidth
 
-                val capped = minOf(concurrency, Kcap)
-                val b = maxRate * capped.toDouble()
-
-                report(
-                    CodeSmell(
-                        issue,
-                        Entity.from(function),
-                        message = "BandwidthSummary q=${qk.q} k=${qk.k} K=$Kcap B=$b"
-                    )
+        val inferredB = inferExpr(body)
+        System.out.println("${function.name}: $annotatedB has $inferredB")
+        if (annotatedB < inferredB) {
+            report(
+                CodeSmell(
+                    issue,
+                    Entity.from(function),
+                    message = "@RequireBandwidth($annotatedB) is too small; body requires ≥ $inferredB"
                 )
-            }
+            )
         }
+
         super.visitNamedFunction(function)
     }
 
-    fun inferExpr(expression: KtExpression): QK {
-        return when (expression) {
+    // =========================
+    // Core Inference
+    // =========================
+
+    fun inferExpr(expression: KtExpression): Double =
+        when (expression) {
             is KtBlockExpression -> inferBlock(expression)
             is KtIfExpression -> inferIf(expression)
-            is KtCallExpression -> {
-                if (isCoroutineScopeExpr(expression, bindingContext)) inferCoroutineScopeExpr(expression)
-                else inferCall(expression)
-            }
-            else -> QK.ZERO
+            is KtCallExpression ->
+                if (isCoroutineScopeExpr(expression, bindingContext))
+                    inferCoroutineScope(expression)
+                else
+                    inferCall(expression)
+            else -> 0.0
         }
-    }
 
-
-    private fun inferBlock(block: KtBlockExpression): QK {
-        var acc = QK.ZERO
+    private fun inferBlock(block: KtBlockExpression): Double {
+        var acc = 0.0
         for (stmt in block.statements) {
-            acc = seqentialCombine(acc, inferExpr(stmt))
+            acc = max(acc, inferExpr(stmt))
         }
         return acc
     }
 
-    private fun inferIf(ifExpr: KtIfExpression): QK {
-        val condQK = ifExpr.condition?.let { inferExpr(it) } ?: QK.ZERO
-        val thenQK = ifExpr.then?.let { inferExpr(it) } ?: QK.ZERO
-        val elseQK = ifExpr.`else`?.let { inferExpr(it) } ?: QK.ZERO
-
-        val branchQ = maxOf(thenQK.q, elseQK.q)
-        val branchK = maxOf(thenQK.k, elseQK.k)
-
-        return QK(
-            q = maxOf(condQK.q, branchQ),
-            k = maxOf(condQK.k, branchK)
-        )
+    private fun inferIf(ifExpr: KtIfExpression): Double {
+        val cond = ifExpr.condition?.let { inferExpr(it) } ?: 0.0
+        val thenB = ifExpr.then?.let { inferExpr(it) } ?: 0.0
+        val elseB = ifExpr.`else`?.let { inferExpr(it) } ?: 0.0
+        return max(cond, max(thenB, elseB))
     }
 
     @OptIn(IDEAPluginsCompatibilityAPI::class)
-    private fun inferCall(call: KtCallExpression): QK {
-        val desc = call.getResolvedCall(bindingContext)?.resultingDescriptor as? FunctionDescriptor
-            ?: return QK.ZERO
+    private fun inferCall(call: KtCallExpression): Double {
+        val desc = call.getResolvedCall(bindingContext)
+            ?.resultingDescriptor as? FunctionDescriptor
+            ?: return 0.0
 
-        // 1) Primitive download
-        val downloadSpec = desc.getDownloadSpecData()
-        if (downloadSpec != null) {
-            val rate = downloadSpec.size / downloadSpec.timeout
-            return QK(q = 1, k = rate) // q = concurrency, k = maxRate
+        // Primitive download
+        desc.getDownloadSpecData()?.let { spec ->
+            return spec.size / spec.timeout
         }
 
-        // 2) Otherwise: recursively analyze the function body
-        val targetFn = desc.source.getPsi() as? KtNamedFunction
-            ?: return QK.ZERO
+        // Modular: use callee's annotation
+        desc.getRequireBandwidthData()?.let { req ->
+            return req.minBandwidth
+        }
 
-        val body = targetFn.bodyExpression ?: return QK.ZERO
+        // Missing annotation
+        report(
+            CodeSmell(
+                issue,
+                Entity.from(call),
+                message = "Call to ${desc.name} is missing @RequireBandwidth"
+            )
+        )
 
-        return inferExpr(body)
+        return 0.0
     }
 
     @OptIn(IDEAPluginsCompatibilityAPI::class)
-    private fun inferCoroutineScopeExpr(call: KtCallExpression): QK {
+    private fun inferCoroutineScope(call: KtCallExpression): Double {
         val body = call.lambdaArguments.singleOrNull()
             ?.getLambdaExpression()
             ?.bodyExpression
-            ?: return QK.ZERO
+            ?: return 0.0
 
-        val block = body
+        var sequentialPart = 0.0
+        val parallelParts = mutableListOf<Double>()
 
-        val launchChildren = mutableListOf<QK>()
-        var sequentialAcc = QK.ZERO
-
-        for (stmt in block.statements) {
+        for (stmt in body.statements) {
             val stmtCall = stmt as? KtCallExpression
             if (stmtCall != null && isLaunchExpr(stmtCall, bindingContext)) {
-                launchChildren += inferLaunchExpr(stmtCall)
+                val launchBody = stmtCall.lambdaArguments.singleOrNull()
+                    ?.getLambdaExpression()
+                    ?.bodyExpression
+                if (launchBody != null) {
+                    parallelParts += inferExpr(launchBody)
+                }
             } else {
-                sequentialAcc = seqentialCombine(sequentialAcc, inferExpr(stmt))
+                sequentialPart = max(sequentialPart, inferExpr(stmt))
             }
         }
 
-        val parallelAcc = parallelCombine(launchChildren)
-        return seqentialCombine(sequentialAcc, parallelAcc)
-    }
+        val parallelBandwidth = parallelParts.sum()
 
-
-    fun inferLaunchExpr(call: KtCallExpression): QK {
-        val body = call.lambdaArguments.singleOrNull()
-            ?.getLambdaExpression()
-            ?.bodyExpression
-            ?: return QK.ZERO
-        return inferExpr(body)
-    }
-
-    fun seqentialCombine(a: QK, b: QK): QK =
-        QK(q = maxOf(a.q, b.q), k = max(a.k, b.k))
-
-   fun parallelCombine(children: List<QK>): QK {
-        var sumQ = 0
-        var maxK = 0.0
-        for (c in children) {
-            sumQ += c.q
-            if (c.k > maxK) maxK = c.k
-        }
-        return QK(q = sumQ, k = maxK)
+        return max(sequentialPart, parallelBandwidth)
     }
 }
