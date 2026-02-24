@@ -5,11 +5,11 @@
 
 package test
 
-import com.loinguyen.bandwidth.detekt.dsl.DownloadSpec
+import com.loinguyen.bandwidth.detekt.dsl.DownloadSpecData
 import com.loinguyen.bandwidth.detekt.dsl.Prio
 import com.loinguyen.bandwidth.detekt.dsl.RequireBandwidth
 
-@DownloadSpec(size = 10.0, timeout = 2.0, prio = Prio.L) // rate = 5.0
+@DownloadSpecData(size = 10.0, timeout = 2.0, prio = Prio.L) // rate = 5.0
 fun dlA() {}
 
 @RequireBandwidth(minBandwidth = 4.0)

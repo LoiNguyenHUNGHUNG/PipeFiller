@@ -5,16 +5,16 @@
 
 package test
 
-import com.loinguyen.bandwidth.detekt.dsl.DownloadSpec
+import com.loinguyen.bandwidth.detekt.dsl.DownloadSpecData
 import com.loinguyen.bandwidth.detekt.dsl.Prio
 import com.loinguyen.bandwidth.detekt.dsl.RequireBandwidth
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
-@DownloadSpec(size = 10.0, timeout = 2.0, prio = Prio.L) // rate = 5.0
+@DownloadSpecData(size = 10.0, timeout = 2.0, prio = Prio.L) // rate = 5.0
 fun dlA() {}
 
-@DownloadSpec(size = 8.0, timeout = 2.0, prio = Prio.L) // rate = 4.0
+@DownloadSpecData(size = 8.0, timeout = 2.0, prio = Prio.L) // rate = 4.0
 fun dlB() {}
 
 @RequireBandwidth(minBandwidth = 8.0) // too small: actual required is 5.0 + 4.0 = 9.0
