@@ -1,6 +1,5 @@
 package com.loinguyen.bandwidth.detekt
 
-import com.loinguyen.bandwidth.detekt.rule.BandwidthFromMainRule
 import io.gitlab.arturbosch.detekt.api.Config
 import io.gitlab.arturbosch.detekt.rules.KotlinCoreEnvironmentTest
 import io.gitlab.arturbosch.detekt.test.compileAndLintWithContext

@@ -1,10 +1,12 @@
-package com.loinguyen.bandwidth.detekt.rule
+package com.loinguyen.bandwidth.detekt
 
 import com.loinguyen.bandwidth.detekt.dsl.Prio
 import com.loinguyen.bandwidth.detekt.dsl.SchedulerKind
 import com.loinguyen.bandwidth.detekt.dsl.getDownloadSpecData
 import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthData
 import com.loinguyen.bandwidth.detekt.dsl.getSchedulerPolicyKindOrDefault
+import com.loinguyen.bandwidth.detekt.rule.isCoroutineScopeExpr
+import com.loinguyen.bandwidth.detekt.rule.isLaunchExpr
 import io.gitlab.arturbosch.detekt.api.*
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.psi.*
@@ -22,10 +24,6 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         Debt.FIVE_MINS
     )
 
-    /**
-     * Current function-level scheduler policy used while analyzing a function body.
-     * Default is UNIFORM.
-     */
     private var currentSchedulerKind: SchedulerKind = SchedulerKind.UNIFORM
 
     override fun visitNamedFunction(function: KtNamedFunction) {
@@ -37,7 +35,6 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         val requireData = desc.getRequireBandwidthData() ?: return
         val annotatedB = requireData.minBandwidth
 
-        // Resolve scheduler policy annotation on this function (or use default)
         val previousScheduler = currentSchedulerKind
         currentSchedulerKind = desc.getSchedulerPolicyKindOrDefault()
 
@@ -53,16 +50,11 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
                 )
             }
         } finally {
-            // restore in case Detekt traverses nested declarations
             currentSchedulerKind = previousScheduler
         }
 
         super.visitNamedFunction(function)
     }
-
-    // =========================
-    // Core Inference
-    // =========================
 
     fun inferExpr(expression: KtExpression): Double =
         when (expression) {
@@ -109,7 +101,7 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
             return spec.size / spec.timeout
         }
 
-        // Modular: use callee's annotation
+        // Modular call
         desc.getRequireBandwidthData()?.let { req ->
             return req.minBandwidth
         }
@@ -121,11 +113,18 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
                 message = "Call to ${desc.name} is missing @RequireBandwidth"
             )
         )
-
         return 0.0
     }
 
-    private data class ParallelChild(val bandwidth: Double, val hasHighPriority: Boolean)
+    private data class ParallelChild(
+        val bandwidth: Double,
+        val hasHighPriority: Boolean
+    )
+
+    private data class ScopeAcc(
+        val sequentialPart: Double,
+        val parallelChildren: List<ParallelChild>
+    )
 
     @OptIn(IDEAPluginsCompatibilityAPI::class)
     private fun inferCoroutineScope(call: KtCallExpression): Double {
@@ -134,39 +133,91 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
             ?.bodyExpression
             ?: return 0.0
 
+        val acc = inferCoroutineScopeBody(body, mutableMapOf())
+        val parallelBandwidth = combineParallelByScheduler(acc.parallelChildren, currentSchedulerKind)
+        return max(acc.sequentialPart, parallelBandwidth)
+    }
+
+    /**
+     * Analyze statements inside a coroutineScope-like batch.
+     *
+     * Supports:
+     *  - launch { ... }
+     *  - repeat(<int>) { ... }
+     *  - list fan-out: xs.forEach { launch { ... } }
+     *
+     * listSizeEnv tracks known local list cardinalities (exact upper bounds).
+     */
+    @OptIn(IDEAPluginsCompatibilityAPI::class)
+    private fun inferCoroutineScopeBody(
+        body: KtBlockExpression,
+        listSizeEnv: MutableMap<String, Int>
+    ): ScopeAcc {
         var sequentialPart = 0.0
         val parallelChildren = mutableListOf<ParallelChild>()
 
         for (stmt in body.statements) {
-            val launchCall = extractLaunchCall(stmt) ?: run {
-                sequentialPart = max(sequentialPart, inferExpr(stmt))
+            // 0) Track local list-size bounds from simple property initializers
+            if (stmt is KtProperty) {
+                val name = stmt.name
+                val init = stmt.initializer
+                if (name != null && init != null) {
+                    inferListUpperBound(init, listSizeEnv)?.let { bound ->
+                        listSizeEnv[name] = bound
+                    }
+                }
+            }
+
+            // 1) Single launch (direct or val x = launch {...})
+            val launchCall = extractLaunchCall(stmt)
+            if (launchCall != null) {
+                val launchBody = launchCall.lambdaArguments.singleOrNull()
+                    ?.getLambdaExpression()
+                    ?.bodyExpression
+
+                if (launchBody != null) {
+                    val childBandwidth = inferExpr(launchBody)
+                    val childHasHigh = containsHighPriorityDownload(launchBody)
+                    parallelChildren += ParallelChild(childBandwidth, childHasHigh)
+                }
                 continue
             }
 
-            val launchBody = launchCall.lambdaArguments.singleOrNull()
-                ?.getLambdaExpression()
-                ?.bodyExpression
-                ?: continue
+            // 2) repeat(n) { ... }
+            val repeatInfo = extractRepeatCall(stmt)
+            if (repeatInfo != null) {
+                val (times, repeatBody) = repeatInfo
+                val nested = inferCoroutineScopeBody(repeatBody, listSizeEnv.toMutableMap())
 
-            val childBandwidth = inferExpr(launchBody)
-            val childHasHigh = containsHighPriorityDownload(launchBody)
+                sequentialPart = max(sequentialPart, nested.sequentialPart)
 
-            parallelChildren += ParallelChild(
-                bandwidth = childBandwidth,
-                hasHighPriority = childHasHigh
-            )
+                repeat(times) {
+                    parallelChildren += nested.parallelChildren
+                }
+                continue
+            }
+
+            // 3) xs.forEach { ... } fan-out
+            val forEachInfo = extractForEachCall(stmt, listSizeEnv)
+            if (forEachInfo != null) {
+                val (times, forEachBody) = forEachInfo
+                val nested = inferCoroutineScopeBody(forEachBody, listSizeEnv.toMutableMap())
+
+                sequentialPart = max(sequentialPart, nested.sequentialPart)
+
+                repeat(times) {
+                    parallelChildren += nested.parallelChildren
+                }
+                continue
+            }
+
+            // 4) Anything else is sequential code in the scope body
+            sequentialPart = max(sequentialPart, inferExpr(stmt))
         }
 
-        val parallelBandwidth = combineParallelByScheduler(parallelChildren, currentSchedulerKind)
-
-        return max(sequentialPart, parallelBandwidth)
+        return ScopeAcc(sequentialPart, parallelChildren)
     }
 
-    /**
-     * Supports:
-     *   launch { ... }
-     *   val j = launch { ... }
-     */
     private fun extractLaunchCall(stmt: KtExpression): KtCallExpression? {
         val direct = stmt as? KtCallExpression
         if (direct != null && isLaunchExpr(direct, bindingContext)) return direct
@@ -178,6 +229,109 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         return null
     }
 
+    /**
+     * Supports only:
+     *   repeat(<int literal>) { ... }
+     */
+    private fun extractRepeatCall(stmt: KtExpression): Pair<Int, KtBlockExpression>? {
+        System.out.println("${stmt.text} ${stmt}")
+        val call = when (stmt) {
+            is KtCallExpression -> stmt
+            is KtProperty -> stmt.initializer as? KtCallExpression
+            else -> null
+        } ?: return null
+
+        if (call.calleeExpression?.text != "repeat") return null
+
+        val timesExpr = call.valueArguments.firstOrNull()?.getArgumentExpression() ?: return null
+        val times = parseIntLiteral(timesExpr) ?: return null
+        if (times <= 0) return null
+
+        val repeatBody = call.lambdaArguments.singleOrNull()
+            ?.getLambdaExpression()
+            ?.bodyExpression
+            ?: return null
+
+        return times to repeatBody
+    }
+
+    private fun extractForEachCall(
+        stmt: KtExpression,
+        listSizeEnv: Map<String, Int>
+    ): Pair<Int, KtBlockExpression>? {
+        val dot = when (stmt) {
+            is KtDotQualifiedExpression -> stmt
+            is KtProperty -> stmt.initializer as? KtDotQualifiedExpression
+            else -> null
+        } ?: return null
+
+        val call = dot.selectorExpression as? KtCallExpression ?: return null
+        if (call.calleeExpression?.text != "forEach") return null
+
+        val receiverExpr = dot.receiverExpression
+        val times = inferListUpperBound(receiverExpr, listSizeEnv) ?: return null
+        if (times <= 0) return null
+
+        val forEachBody = call.lambdaArguments.singleOrNull()
+            ?.getLambdaExpression()
+            ?.bodyExpression
+            ?: return null
+
+        return times to forEachBody
+    }
+
+    /**
+     * Quick, local upper-bound inference for list cardinality.
+     *
+     * Supports:
+     *  - listOf(a,b,c) / mutableListOf(...)
+     *  - List(10) { ... }
+     *  - local variable references from listSizeEnv
+     *  - if (...) e1 else e2   ==> max(bound(e1), bound(e2))
+     */
+    private fun inferListUpperBound(
+        expr: KtExpression,
+        listSizeEnv: Map<String, Int>
+    ): Int? {
+        return when (expr) {
+            is KtNameReferenceExpression -> {
+                listSizeEnv[expr.getReferencedName()]
+            }
+
+            is KtIfExpression -> {
+                val t = expr.then?.let { inferListUpperBound(it, listSizeEnv) }
+                val e = expr.`else`?.let { inferListUpperBound(it, listSizeEnv) }
+                if (t != null && e != null) max(t, e) else null
+            }
+
+            is KtCallExpression -> {
+                val callee = expr.calleeExpression?.text ?: return null
+                when (callee) {
+                    "listOf", "mutableListOf" -> expr.valueArguments.size
+                    "List" -> {
+                        val nExpr = expr.valueArguments.firstOrNull()?.getArgumentExpression()
+                        parseIntLiteral(nExpr)
+                    }
+                    else -> null
+                }
+            }
+
+            is KtBlockExpression -> {
+                val lastExpr = expr.statements.lastOrNull() as? KtExpression
+                if (lastExpr != null) inferListUpperBound(lastExpr, listSizeEnv) else null
+            }
+
+            else -> null
+        }
+    }
+
+    private fun parseIntLiteral(expr: KtExpression?): Int? {
+        return when (expr) {
+            is KtConstantExpression -> expr.text.toIntOrNull()
+            else -> null
+        }
+    }
+
     private fun combineParallelByScheduler(
         children: List<ParallelChild>,
         schedulerKind: SchedulerKind
@@ -185,18 +339,9 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         if (children.isEmpty()) return 0.0
 
         return when (schedulerKind) {
-            SchedulerKind.UNIFORM -> {
-                // Current prototype semantics: all overlap => sum
-                children.sumOf { it.bandwidth }
-            }
-
-            SchedulerKind.SEQUENTIAL_BATCH -> {
-                // Treat child tasks as non-overlapping
-                children.maxOf { it.bandwidth }
-            }
-
+            SchedulerKind.UNIFORM -> children.sumOf { it.bandwidth }
+            SchedulerKind.SEQUENTIAL_BATCH -> children.maxOf { it.bandwidth }
             SchedulerKind.PHASED_BY_PRIORITY -> {
-                // High and low priority phases do not overlap
                 val hi = children.filter { it.hasHighPriority }.sumOf { it.bandwidth }
                 val lo = children.filterNot { it.hasHighPriority }.sumOf { it.bandwidth }
                 max(hi, lo)
@@ -204,12 +349,6 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         }
     }
 
-    /**
-     * Conservative priority summary for a launch body:
-     * returns true iff the subtree contains any high-priority primitive download.
-     *
-     * This is a lightweight approximation of the paper's priority join.
-     */
     @OptIn(IDEAPluginsCompatibilityAPI::class)
     private fun containsHighPriorityDownload(expr: KtExpression): Boolean {
         var found = false
@@ -229,6 +368,7 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
                 }
             }
         })
+
         return found
     }
 }
