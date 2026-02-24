@@ -49,7 +49,6 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         val annotatedB = requireData.minBandwidth
 
         val inferredB = inferExpr(body)
-        System.out.println("${function.name}: $annotatedB has $inferredB")
         if (annotatedB < inferredB) {
             report(
                 CodeSmell(
