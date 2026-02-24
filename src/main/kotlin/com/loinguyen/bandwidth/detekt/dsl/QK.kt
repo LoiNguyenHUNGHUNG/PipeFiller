@@ -8,3 +8,7 @@ data class QK (
         val ZERO = QK(0, 0.0)
     }
 }
+
+data class QKP(val q: Int, val k: Double, val p: Prio) {
+    companion object { val ZERO = QKP(0, 0.0, Prio.L) }
+}

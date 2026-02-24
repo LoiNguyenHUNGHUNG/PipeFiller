@@ -28,7 +28,6 @@ internal class BandwidthFromMainRuleTest(private val env: KotlinCoreEnvironment)
             val spec = TestSpec.parse(text, file.fileName.toString())
 
             val findings = BandwidthFromMainRule(Config.empty).compileAndLintWithContext(env, text)
-
             assertEquals(
                 spec.expectFindings,
                 findings.size,
