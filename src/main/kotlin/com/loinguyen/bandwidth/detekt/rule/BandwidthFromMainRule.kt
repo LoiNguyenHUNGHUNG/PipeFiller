@@ -24,6 +24,13 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         Debt.FIVE_MINS
     )
 
+    private val asyncWithoutAwaitIssue = Issue(
+        "${javaClass.simpleName}AsyncWithoutAwaitAll",
+        Severity.Defect,
+        "async used inside coroutineScope without awaitAll()",
+        Debt.FIVE_MINS
+    )
+
     private var currentSchedulerKind: SchedulerKind = SchedulerKind.UNIFORM
 
     override fun visitNamedFunction(function: KtNamedFunction) {
@@ -96,6 +103,12 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
             ?.resultingDescriptor as? FunctionDescriptor
             ?: return 0.0
 
+        // 0) awaitAll does not itself consume bandwidth; it just waits.
+        //    Handle both top-level awaitAll(...) and extension awaitAll on collections.
+        if (desc.name.asString() == "awaitAll") {
+            return 0.0
+        }
+
         // Primitive download
         desc.getDownloadSpecData()?.let { spec ->
             return spec.size / spec.timeout
@@ -132,6 +145,19 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
             ?.getLambdaExpression()
             ?.bodyExpression
             ?: return 0.0
+
+        val hasAsync = containsAsync(body)
+        val hasAwaitAll = containsAwaitAll(body)
+
+        if (hasAsync && !hasAwaitAll) {
+            report(
+                CodeSmell(
+                    asyncWithoutAwaitIssue,
+                    Entity.from(body),
+                    message = "coroutineScope contains async but no awaitAll()"
+                )
+            )
+        }
 
         val acc = inferCoroutineScopeBody(body, mutableMapOf())
         val parallelBandwidth = combineParallelByScheduler(acc.parallelChildren, currentSchedulerKind)
@@ -183,6 +209,21 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
                 continue
             }
 
+            // 1b) Single async (direct or val x = async {...})
+            val asyncCall = extractAsyncCall(stmt)
+            if (asyncCall != null) {
+                val asyncBody = asyncCall.lambdaArguments.singleOrNull()
+                    ?.getLambdaExpression()
+                    ?.bodyExpression
+
+                if (asyncBody != null) {
+                    val childBandwidth = inferExpr(asyncBody)
+                    val childHasHigh = containsHighPriorityDownload(asyncBody)
+                    parallelChildren += ParallelChild(childBandwidth, childHasHigh)
+                }
+                continue
+            }
+
             // 2) repeat(n) { ... }
             val repeatInfo = extractRepeatCall(stmt)
             if (repeatInfo != null) {
@@ -225,6 +266,26 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         val prop = stmt as? KtProperty
         val initCall = prop?.initializer as? KtCallExpression
         if (initCall != null && isLaunchExpr(initCall, bindingContext)) return initCall
+
+        return null
+    }
+
+    @OptIn(IDEAPluginsCompatibilityAPI::class)
+    private fun isAsyncCall(call: KtCallExpression): Boolean {
+        val desc = call.getResolvedCall(bindingContext)
+            ?.resultingDescriptor as? FunctionDescriptor
+            ?: return false
+
+        return desc.name.asString() == "async"
+    }
+
+    private fun extractAsyncCall(stmt: KtExpression): KtCallExpression? {
+        val direct = stmt as? KtCallExpression
+        if (direct != null && isAsyncCall(direct)) return direct
+
+        val prop = stmt as? KtProperty
+        val initCall = prop?.initializer as? KtCallExpression
+        if (initCall != null && isAsyncCall(initCall)) return initCall
 
         return null
     }
@@ -364,6 +425,50 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
 
                 val spec = desc.getDownloadSpecData() ?: return
                 if (spec.prio == Prio.H) {
+                    found = true
+                }
+            }
+        })
+
+        return found
+    }
+
+    @OptIn(IDEAPluginsCompatibilityAPI::class)
+    private fun containsAsync(body: KtBlockExpression): Boolean {
+        var found = false
+
+        body.accept(object : KtTreeVisitorVoid() {
+            override fun visitCallExpression(expression: KtCallExpression) {
+                super.visitCallExpression(expression)
+                if (found) return
+
+                val desc = expression.getResolvedCall(bindingContext)
+                    ?.resultingDescriptor as? FunctionDescriptor
+                    ?: return
+
+                if (desc.name.asString() == "async") {
+                    found = true
+                }
+            }
+        })
+
+        return found
+    }
+
+    @OptIn(IDEAPluginsCompatibilityAPI::class)
+    private fun containsAwaitAll(body: KtBlockExpression): Boolean {
+        var found = false
+
+        body.accept(object : KtTreeVisitorVoid() {
+            override fun visitCallExpression(expression: KtCallExpression) {
+                super.visitCallExpression(expression)
+                if (found) return
+
+                val desc = expression.getResolvedCall(bindingContext)
+                    ?.resultingDescriptor as? FunctionDescriptor
+                    ?: return
+
+                if (desc.name.asString() == "awaitAll") {
                     found = true
                 }
             }
