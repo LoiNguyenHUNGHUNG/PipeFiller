@@ -40,6 +40,3 @@ private fun Annotated.readRequireBandwidth(): RequireBandwidthData? {
 fun FunctionDescriptor.getRequireBandwidthData(): RequireBandwidthData? =
     (this as Annotated).readRequireBandwidth()
 
-// For higher-order parameters
-fun ValueParameterDescriptor.getRequireBandwidthRequirement(): RequireBandwidthData? =
-    (this as Annotated).readRequireBandwidth()

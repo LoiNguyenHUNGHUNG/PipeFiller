@@ -13,7 +13,7 @@ suspend fun fastOp() {
 
 @RequireBandwidth(minBandwidth = 1.0) // error: 5.0 > 1.0
 suspend fun hofOk(
-    @RequireBandwidth(minBandwidth = 5.0) op: suspend () -> Unit
+     op: @RequireBandwidth(minBandwidth = 5.0) suspend () -> Unit
 ) {
     op()
 }

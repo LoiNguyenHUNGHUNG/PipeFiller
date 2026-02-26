@@ -5,7 +5,6 @@ import com.loinguyen.bandwidth.detekt.dsl.SchedulerKind
 import com.loinguyen.bandwidth.detekt.dsl.getDownloadSpecData
 import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthData
 import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthOnType
-import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthRequirement
 import com.loinguyen.bandwidth.detekt.dsl.getSchedulerPolicyKindOrDefault
 import com.loinguyen.bandwidth.detekt.rule.isCoroutineScopeExpr
 import com.loinguyen.bandwidth.detekt.rule.isLaunchExpr
@@ -558,15 +557,13 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
     private fun checkHigherOrderArgumentConstraints(
         resolved: ResolvedCall<out CallableDescriptor>
     ) {
-        val callee = resolved.resultingDescriptor
-
         for ((param, resolvedArg) in resolved.valueArguments) {
             val valueParam = param as ValueParameterDescriptor
 
             // Only care about parameters that:
             //  1) have @RequireBandwidth
             //  2) are function-typed (HOF parameters)
-            val requirement = valueParam.getRequireBandwidthRequirement() ?: continue
+            val requirement = valueParam.type.getRequireBandwidthOnType() ?: continue
             if (!valueParam.isFunctionTyped()) continue
 
             // For now, only handle the simple 1-argument case, not varargs
@@ -590,11 +587,7 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
 
     private fun ValueParameterDescriptor.effectiveFunctionRequirement(): Double? {
         if (!isFunctionTyped()) return null
-
-        // Prefer type-level annotation, fall back to parameter annotation
         type.getRequireBandwidthOnType()?.let { return it.minBandwidth }
-        getRequireBandwidthRequirement()?.let { return it.minBandwidth }
-
         return null
     }
 
@@ -617,9 +610,8 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
 
             is ValueParameterDescriptor -> {
                 if (!descriptor.isFunctionTyped()) return null
-                // Prefer type-level, then parameter-level @RequireBandwidth
                 descriptor.type.getRequireBandwidthOnType()?.minBandwidth
-                    ?: descriptor.getRequireBandwidthRequirement()?.minBandwidth
+                    ?: return null
             }
 
             is VariableDescriptor -> {
