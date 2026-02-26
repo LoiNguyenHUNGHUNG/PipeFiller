@@ -295,7 +295,6 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
      *   repeat(<int literal>) { ... }
      */
     private fun extractRepeatCall(stmt: KtExpression): Pair<Int, KtBlockExpression>? {
-        System.out.println("${stmt.text} ${stmt}")
         val call = when (stmt) {
             is KtCallExpression -> stmt
             is KtProperty -> stmt.initializer as? KtCallExpression
