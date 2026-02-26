@@ -4,6 +4,7 @@ import com.loinguyen.bandwidth.detekt.dsl.Prio
 import com.loinguyen.bandwidth.detekt.dsl.SchedulerKind
 import com.loinguyen.bandwidth.detekt.dsl.getDownloadSpecData
 import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthData
+import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthOnType
 import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthRequirement
 import com.loinguyen.bandwidth.detekt.dsl.getSchedulerPolicyKindOrDefault
 import com.loinguyen.bandwidth.detekt.rule.isCoroutineScopeExpr
@@ -12,6 +13,7 @@ import io.gitlab.arturbosch.detekt.api.*
 import org.jetbrains.kotlin.descriptors.CallableDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.descriptors.ValueParameterDescriptor
+import org.jetbrains.kotlin.descriptors.VariableDescriptor
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.calls.callUtil.getResolvedCall
@@ -45,23 +47,44 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         val desc = bindingContext[BindingContext.FUNCTION, function] as? FunctionDescriptor
             ?: return
 
-        val requireData = desc.getRequireBandwidthData() ?: return
-        val annotatedB = requireData.minBandwidth
-
         val previousScheduler = currentSchedulerKind
         currentSchedulerKind = desc.getSchedulerPolicyKindOrDefault()
 
         try {
-            val inferredB = inferExpr(body)
-            if (annotatedB < inferredB) {
-                report(
-                    CodeSmell(
-                        issue,
-                        Entity.from(function),
-                        message = "@RequireBandwidth($annotatedB) is too small; body requires ≥ $inferredB"
+            // 1) Check the function's own @RequireBandwidth, if present
+            desc.getRequireBandwidthData()?.let { requireData ->
+                val annotatedB = requireData.minBandwidth
+                val inferredB = inferExpr(body)
+
+                if (annotatedB < inferredB) {
+                    report(
+                        CodeSmell(
+                            issue,
+                            Entity.from(function),
+                            message = "@RequireBandwidth($annotatedB) is too small; body requires ≥ $inferredB"
+                        )
                     )
-                )
+                }
             }
+
+            // 2) Check a function-typed return's @RequireBandwidth on the TYPE, if present
+            desc.returnType
+                ?.getRequireBandwidthOnType()
+                ?.let { retTypeData ->
+                    val returnedBw = inferReturnedFunctionBandwidth(function) ?: return@let
+
+                    if (retTypeData.minBandwidth < returnedBw) {
+                        val entity = Entity.from(function.nameIdentifier ?: function)
+                        report(
+                            CodeSmell(
+                                issue,
+                                entity,
+                                message = "@RequireBandwidth(${retTypeData.minBandwidth}) on return type is too small; " +
+                                        "returned function body requires ≥ $returnedBw"
+                            )
+                        )
+                    }
+                }
         } finally {
             currentSchedulerKind = previousScheduler
         }
@@ -111,26 +134,21 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         // Enforce @RequireBandwidth on higher-order parameters at this call site
         checkHigherOrderArgumentConstraints(resolved)
 
-        // Special case: calls to function-typed values, e.g. op()
-        // This is resolved as an 'invoke' on a function or suspend function type.
+        // Special case: calls to function-typed values, e.g. op() or g().
+        // These are resolved as 'invoke' on a function or suspend function type.
         if (desc.isFunctionTypeInvoke()) {
             val calleeName = call.calleeExpression as? KtNameReferenceExpression
                 ?: return 0.0
 
             val valueDescriptor = bindingContext[BindingContext.REFERENCE_TARGET, calleeName]
-                    as? ValueParameterDescriptor
+                    as? CallableDescriptor
                 ?: return 0.0
 
-            val requirement = valueDescriptor.getRequireBandwidthRequirement()
-                ?: return 0.0
-
-            // Inside the HOF body, model op() as consuming at least the parameter's
-            // declared @RequireBandwidth.
-            return requirement.minBandwidth
+            val bw = bandwidthOfFunctionValue(valueDescriptor) ?: return 0.0
+            return bw
         }
 
         // 0) awaitAll does not itself consume bandwidth; it just waits.
-        //    Handle both top-level awaitAll(...) and extension awaitAll on collections.
         if (desc.name.asString() == "awaitAll") {
             return 0.0
         }
@@ -193,22 +211,13 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
     private fun inferFunctionArgBandwidth(argExpr: KtExpression): Double? {
         // We only handle function references for now: ::foo
         if (argExpr is KtCallableReferenceExpression) {
-            // `callableReference` is the `foo` part in `::foo`
             val simpleName = argExpr.callableReference
 
             val target = bindingContext[BindingContext.REFERENCE_TARGET, simpleName]
-                    as? FunctionDescriptor
+                    as? CallableDescriptor
                 ?: return null
 
-            target.getDownloadSpecData()?.let { spec ->
-                return spec.size / spec.timeout
-            }
-
-            target.getRequireBandwidthData()?.let { req ->
-                return req.minBandwidth
-            }
-
-            return null
+            return bandwidthOfFunctionValue(target)
         }
 
         // Other argument shapes (lambdas, variables, etc.) not handled yet
@@ -576,6 +585,75 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
                     )
                 )
             }
+        }
+    }
+
+    private fun ValueParameterDescriptor.effectiveFunctionRequirement(): Double? {
+        if (!isFunctionTyped()) return null
+
+        // Prefer type-level annotation, fall back to parameter annotation
+        type.getRequireBandwidthOnType()?.let { return it.minBandwidth }
+        getRequireBandwidthRequirement()?.let { return it.minBandwidth }
+
+        return null
+    }
+
+    private fun bandwidthOfFunctionValue(descriptor: CallableDescriptor): Double? {
+        return when (descriptor) {
+            is FunctionDescriptor -> {
+                // Direct function: primitive download spec wins, then function-level @RequireBandwidth,
+                // then (optionally) a type-level annotation on its function type.
+                descriptor.getDownloadSpecData()?.let { spec ->
+                    return spec.size / spec.timeout
+                }
+
+                descriptor.getRequireBandwidthData()?.let { req ->
+                    return req.minBandwidth
+                }
+
+                // If you ever annotate the function-as-type, you could fall back to:
+                descriptor.returnType?.getRequireBandwidthOnType()?.minBandwidth
+            }
+
+            is ValueParameterDescriptor -> {
+                if (!descriptor.isFunctionTyped()) return null
+                // Prefer type-level, then parameter-level @RequireBandwidth
+                descriptor.type.getRequireBandwidthOnType()?.minBandwidth
+                    ?: descriptor.getRequireBandwidthRequirement()?.minBandwidth
+            }
+
+            is VariableDescriptor -> {
+                // Local or member variable holding a function; read from its type annotation.
+                descriptor.type.getRequireBandwidthOnType()?.minBandwidth
+            }
+
+            else -> null
+        }
+    }
+
+    private fun inferReturnedFunctionBandwidth(function: KtNamedFunction): Double? {
+        val body = function.bodyExpression ?: return null
+
+        return when (body) {
+            // Block body with a single `return { ... }`
+            is KtBlockExpression -> {
+                val returns = body.statements.filterIsInstance<KtReturnExpression>()
+                if (returns.size != 1) return null
+
+                val returnedExpr = returns.single().returnedExpression as? KtLambdaExpression
+                    ?: return null
+
+                val lambdaBody = returnedExpr.bodyExpression ?: return 0.0
+                inferExpr(lambdaBody)
+            }
+
+            // Expression-body function: `fun f(...) = { ... }`
+            is KtLambdaExpression -> {
+                val lambdaBody = body.bodyExpression ?: return 0.0
+                inferExpr(lambdaBody)
+            }
+
+            else -> null
         }
     }
 }
