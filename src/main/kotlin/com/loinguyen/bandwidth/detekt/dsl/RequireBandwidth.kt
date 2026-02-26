@@ -1,14 +1,17 @@
 package com.loinguyen.bandwidth.detekt.dsl
 
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
+import org.jetbrains.kotlin.descriptors.ValueParameterDescriptor
+import org.jetbrains.kotlin.descriptors.annotations.Annotated
 
-@Target(AnnotationTarget.FUNCTION)
+@Target(AnnotationTarget.FUNCTION, AnnotationTarget.VALUE_PARAMETER)
 @Retention(AnnotationRetention.BINARY)
 annotation class RequireBandwidth(val minBandwidth: Double)
 
 data class RequireBandwidthData(val minBandwidth: Double)
 
-fun FunctionDescriptor.getRequireBandwidthData(): RequireBandwidthData? {
+// internal helper: shared by functions & parameters
+private fun Annotated.readRequireBandwidth(): RequireBandwidthData? {
     val ann = annotations.firstOrNull {
         it.fqName?.shortName()?.asString() == "RequireBandwidth"
     } ?: return null
@@ -19,3 +22,11 @@ fun FunctionDescriptor.getRequireBandwidthData(): RequireBandwidthData? {
 
     return RequireBandwidthData(bw)
 }
+
+// For functions
+fun FunctionDescriptor.getRequireBandwidthData(): RequireBandwidthData? =
+    (this as Annotated).readRequireBandwidth()
+
+// For higher-order parameters
+fun ValueParameterDescriptor.getRequireBandwidthRequirement(): RequireBandwidthData? =
+    (this as Annotated).readRequireBandwidth()

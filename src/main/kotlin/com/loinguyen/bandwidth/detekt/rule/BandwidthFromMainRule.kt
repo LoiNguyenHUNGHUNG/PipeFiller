@@ -4,14 +4,20 @@ import com.loinguyen.bandwidth.detekt.dsl.Prio
 import com.loinguyen.bandwidth.detekt.dsl.SchedulerKind
 import com.loinguyen.bandwidth.detekt.dsl.getDownloadSpecData
 import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthData
+import com.loinguyen.bandwidth.detekt.dsl.getRequireBandwidthRequirement
 import com.loinguyen.bandwidth.detekt.dsl.getSchedulerPolicyKindOrDefault
 import com.loinguyen.bandwidth.detekt.rule.isCoroutineScopeExpr
 import com.loinguyen.bandwidth.detekt.rule.isLaunchExpr
 import io.gitlab.arturbosch.detekt.api.*
+import org.jetbrains.kotlin.descriptors.CallableDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
+import org.jetbrains.kotlin.descriptors.ValueParameterDescriptor
 import org.jetbrains.kotlin.psi.*
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.calls.callUtil.getResolvedCall
+import org.jetbrains.kotlin.resolve.calls.model.ResolvedCall
+import org.jetbrains.kotlin.resolve.descriptorUtil.fqNameSafe
+import org.jetbrains.kotlin.types.KotlinType
 import org.jetbrains.kotlin.utils.IDEAPluginsCompatibilityAPI
 import kotlin.math.max
 
@@ -99,9 +105,29 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
 
     @OptIn(IDEAPluginsCompatibilityAPI::class)
     private fun inferCall(call: KtCallExpression): Double {
-        val desc = call.getResolvedCall(bindingContext)
-            ?.resultingDescriptor as? FunctionDescriptor
-            ?: return 0.0
+        val resolved = call.getResolvedCall(bindingContext) ?: return 0.0
+        val desc = resolved.resultingDescriptor as? FunctionDescriptor ?: return 0.0
+
+        // Enforce @RequireBandwidth on higher-order parameters at this call site
+        checkHigherOrderArgumentConstraints(resolved)
+
+        // Special case: calls to function-typed values, e.g. op()
+        // This is resolved as an 'invoke' on a function or suspend function type.
+        if (desc.isFunctionTypeInvoke()) {
+            val calleeName = call.calleeExpression as? KtNameReferenceExpression
+                ?: return 0.0
+
+            val valueDescriptor = bindingContext[BindingContext.REFERENCE_TARGET, calleeName]
+                    as? ValueParameterDescriptor
+                ?: return 0.0
+
+            val requirement = valueDescriptor.getRequireBandwidthRequirement()
+                ?: return 0.0
+
+            // Inside the HOF body, model op() as consuming at least the parameter's
+            // declared @RequireBandwidth.
+            return requirement.minBandwidth
+        }
 
         // 0) awaitAll does not itself consume bandwidth; it just waits.
         //    Handle both top-level awaitAll(...) and extension awaitAll on collections.
@@ -162,6 +188,31 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         val acc = inferCoroutineScopeBody(body, mutableMapOf())
         val parallelBandwidth = combineParallelByScheduler(acc.parallelChildren, currentSchedulerKind)
         return max(acc.sequentialPart, parallelBandwidth)
+    }
+
+    private fun inferFunctionArgBandwidth(argExpr: KtExpression): Double? {
+        // We only handle function references for now: ::foo
+        if (argExpr is KtCallableReferenceExpression) {
+            // `callableReference` is the `foo` part in `::foo`
+            val simpleName = argExpr.callableReference
+
+            val target = bindingContext[BindingContext.REFERENCE_TARGET, simpleName]
+                    as? FunctionDescriptor
+                ?: return null
+
+            target.getDownloadSpecData()?.let { spec ->
+                return spec.size / spec.timeout
+            }
+
+            target.getRequireBandwidthData()?.let { req ->
+                return req.minBandwidth
+            }
+
+            return null
+        }
+
+        // Other argument shapes (lambdas, variables, etc.) not handled yet
+        return null
     }
 
     /**
@@ -474,5 +525,57 @@ class BandwidthFromMainRule(config: Config) : Rule(config) {
         })
 
         return found
+    }
+
+    private fun ValueParameterDescriptor.isFunctionTyped(): Boolean {
+        val t: KotlinType = type
+        val fqName = t.constructor.declarationDescriptor?.fqNameSafe?.asString() ?: return false
+        return fqName.startsWith("kotlin.Function") ||
+                fqName.startsWith("kotlin.coroutines.SuspendFunction")
+    }
+
+    private fun FunctionDescriptor.isFunctionTypeInvoke(): Boolean {
+        if (name.asString() != "invoke") return false
+
+        val dispatchType = dispatchReceiverParameter?.type ?: return false
+        val fqName = dispatchType.constructor.declarationDescriptor?.fqNameSafe?.asString()
+            ?: return false
+
+        return fqName.startsWith("kotlin.Function") ||
+                fqName.startsWith("kotlin.coroutines.SuspendFunction")
+    }
+
+    @OptIn(IDEAPluginsCompatibilityAPI::class)
+    private fun checkHigherOrderArgumentConstraints(
+        resolved: ResolvedCall<out CallableDescriptor>
+    ) {
+        val callee = resolved.resultingDescriptor
+
+        for ((param, resolvedArg) in resolved.valueArguments) {
+            val valueParam = param as ValueParameterDescriptor
+
+            // Only care about parameters that:
+            //  1) have @RequireBandwidth
+            //  2) are function-typed (HOF parameters)
+            val requirement = valueParam.getRequireBandwidthRequirement() ?: continue
+            if (!valueParam.isFunctionTyped()) continue
+
+            // For now, only handle the simple 1-argument case, not varargs
+            val argExpr = resolvedArg.arguments.singleOrNull()?.getArgumentExpression()
+                ?: continue
+
+            val actualBw = inferFunctionArgBandwidth(argExpr)
+
+            // If we can compute the argument's bandwidth and it's too small, report
+            if (actualBw != null && actualBw > requirement.minBandwidth) {
+                report(
+                    CodeSmell(
+                        issue,
+                        Entity.from(argExpr),
+                        message = "Argument for parameter '${valueParam.name}' has bandwidth $actualBw but parameter requires ≥ ${requirement.minBandwidth}"
+                    )
+                )
+            }
+        }
     }
 }
